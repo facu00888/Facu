@@ -1,3 +1,4 @@
-easyocr==1.7.1
+easyocr
+numpy
 pillow
-pypdf
+pymupdf
