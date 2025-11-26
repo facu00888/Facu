@@ -8,13 +8,6 @@ Extractor simple de metadatos de e-Facturas (UY) desde:
 
 Uso (Windows):
   python invoice_parser.py "C:\Proyectos\Facu\Facturas" --json --debug --backend auto
-
-Salida:
-  Lista JSON con campos:
-    fecha, serie, folio, serie_y_folio, razon_social, rut_emisor,
-    es_nota_de_credito, importe_total_con_iva (+ _num),
-    importe_sin_iva (+ _num + _fuente),
-    _archivo, _fuente
 """
 
 from __future__ import annotations
@@ -96,12 +89,18 @@ class InvoiceResult:
 
 
 # ---------------------------
-# Utilidades
+# Regex / utilidades
 # ---------------------------
 
 DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
+
+# Dinero "normal" UY: 1.234,56 o 123,45
 MONEY_RE = re.compile(r"\b(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:,\d{2}))\b")
-MONEY_RE_LOOSE = re.compile(r"\b(-?\d{3,})\b")
+
+# OCR mugriento: números sin separador (evitar años => mínimo 5 dígitos por defecto)
+MONEY_RE_LOOSE_TOTAL = re.compile(r"\b(-?\d{5,})\b")
+MONEY_RE_LOOSE_ANY = re.compile(r"\b(-?\d{3,})\b")  # solo para IVA allow_short
+
 RUT_RE = re.compile(r"\b(\d{3}[.\-]?\d{3}[.\-]?\d{3}[.\-]?\d{3}|\d{11,12})\b")
 
 
@@ -114,18 +113,12 @@ def _collapse_spaces(s: str | None) -> str:
 
 
 def normalize_text_block(text: str) -> str:
-    """Normaliza saltos de línea y espacios para mejorar las búsquedas."""
     lines = [_collapse_spaces(line) for line in text.splitlines()]
     lines = [ln for ln in lines if ln]
     return "\n".join(lines)
 
 
 def parse_money_uy(s: str) -> Optional[float]:
-    """
-    Convierte:
-      "4.919,61" -> 4919.61
-      "701,00"   -> 701.0
-    """
     if not s:
         return None
     s = s.strip()
@@ -150,10 +143,9 @@ def parse_money_uy_loose(s: str, *, allow_short: bool = False) -> Optional[float
     """
     Interpreta montos sin separadores (fallback OCR sucio):
       "401247" -> 4012.47
-      "-11813" -> -118.13
 
-    Por defecto ignora cadenas de menos de 4 dígitos para no capturar años.
-    Si allow_short=True, acepta 3 dígitos (p.ej. IVA leido como 224).
+    Para evitar capturar años tipo 2027 => por defecto requiere >= 5 dígitos.
+    allow_short=True permite 3-4 dígitos (para IVA leído como 224, etc.).
     """
     if not s:
         return None
@@ -164,10 +156,14 @@ def parse_money_uy_loose(s: str, *, allow_short: bool = False) -> Optional[float
     digits = re.sub(r"\D", "", s)
     if not digits:
         return None
-    if len(digits) < 4 and not allow_short:
-        return None
-    if len(digits) < 3:
-        return None
+
+    if allow_short:
+        if len(digits) < 3:
+            return None
+    else:
+        if len(digits) < 5:
+            return None
+
     whole = digits[:-2] or "0"
     frac = digits[-2:]
     try:
@@ -178,14 +174,10 @@ def parse_money_uy_loose(s: str, *, allow_short: bool = False) -> Optional[float
 
 
 def parse_money_with_fallback(s: str, *, allow_short: bool = False) -> Optional[float]:
-    """Primero intenta el formato UY estándar, luego sin separadores."""
     return parse_money_uy(s) or parse_money_uy_loose(s, allow_short=allow_short)
 
 
 def format_money_uy(v: Optional[float]) -> Optional[str]:
-    """
-    4919.61 -> "4.919,61"
-    """
     if v is None:
         return None
     v = round(float(v), 2)
@@ -199,11 +191,6 @@ def format_money_uy(v: Optional[float]) -> Optional[str]:
 
 
 def derive_razon_social_from_filename(path: Path) -> Optional[str]:
-    """
-    Usa el nombre del archivo como fuente "fuerte" para razón social:
-      "BIMBO A3519972 CREDITO.jpeg" -> "BIMBO"
-      "DEL SUR NOTA DE CREDITO A18911 CREDITO.jpeg" -> "DEL SUR"
-    """
     stem = _safe_upper(path.stem)
     stem = re.sub(r"[_\-]+", " ", stem)
     stem = _collapse_spaces(stem)
@@ -219,16 +206,36 @@ def is_credit_note(text: str, path: Path) -> bool:
     return ("NOTA DE CREDITO" in x) or ("NOTA DE CRÉDITO" in x)
 
 
-def pick_best_date(text: str) -> Optional[str]:
+def extract_fecha_documento(text: str) -> Optional[str]:
+    """
+    - Prioriza "FECHA DE DOCUMENTO: dd/mm/aaaa"
+    - Maneja el caso "FECHA VENCIMIENTO ... dd/mm/aaaa dd/mm/aaaa" -> toma la primera.
+    - Fallback: heurística general.
+    """
     if not text:
         return None
+    up = _safe_upper(text)
 
+    m = re.search(r"\bFECHA\s+DE\s+DOCUMENTO\b[^0-9]{0,30}(\d{1,2}/\d{1,2}/\d{4})", up)
+    if m:
+        return m.group(1)
+
+    # Caso típico BIMBO: "Fecha Vencimiento Moneda 1/10/2025 12/11/2025"
+    m = re.search(
+        r"\bFECHA\b.{0,40}\bVENCIMIENTO\b.{0,40}(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})",
+        up,
+        flags=re.S,
+    )
+    if m:
+        return m.group(1)
+
+    # Heurística general
     best = None
     best_score = -10_000.0
-    for m in DATE_RE.finditer(text):
-        d = m.group(1)
-        i = m.start()
-        ctx = _safe_upper(text[max(0, i - 40) : i + 40])
+    for dmatch in DATE_RE.finditer(up):
+        d = dmatch.group(1)
+        i = dmatch.start()
+        ctx = up[max(0, i - 50) : i + 50]
 
         score = 0.0
         if "FECHA DE DOCUMENTO" in ctx:
@@ -236,13 +243,12 @@ def pick_best_date(text: str) -> Optional[str]:
         elif re.search(r"\bFECHA\b", ctx):
             score += 6.0
 
-        # Castigo MUCHO mayor a fechas asociadas a vencimiento
+        # castigo fuerte a vencimientos/CAE
         if "VENC" in ctx or "VTO" in ctx:
             score -= 25.0
         if "CAE" in ctx:
             score -= 8.0
 
-        # Preferir fechas al inicio del documento
         score += max(0, 2500 - i) / 2500.0
 
         if score > best_score:
@@ -259,13 +265,13 @@ def _clean_rut(raw: str) -> str:
 def extract_rut_emisor(text: str) -> Optional[str]:
     if not text:
         return None
-
     up = _safe_upper(text)
 
     m = re.search(r"\bRU[TC]\s*EMISOR\b[^0-9]{0,30}(\d{3}[.\-]?\d{3}[.\-]?\d{3}[.\-]?\d{3}|\d{11,12})", up)
     if m:
         return _clean_rut(m.group(1))
 
+    # muchas facturas solo dicen "RUC" al principio
     m = re.search(r"\bRUC\b[^0-9]{0,30}(\d{3}[.\-]?\d{3}[.\-]?\d{3}[.\-]?\d{3}|\d{11,12})", up)
     if m:
         return _clean_rut(m.group(1))
@@ -277,16 +283,7 @@ def extract_rut_emisor(text: str) -> Optional[str]:
     return None
 
 
-def _looks_like_rut(num: str) -> bool:
-    digits = re.sub(r"\D", "", num)
-    return len(digits) >= 9  # RUT / cédulas / cosas largas; no usar como folio
-
-
 def extract_serie_folio_from_filename(path: Path) -> tuple[Optional[str], Optional[str]]:
-    """
-    Extrae serie/folio desde el nombre del archivo:
-      "BIMBO A3519972 CREDITO.jpeg" -> ("A", "3519972")
-    """
     stem = _safe_upper(path.stem)
     m = re.search(r"\b([A-Z])\s*0*([0-9]{3,8})\b", stem)
     if not m:
@@ -300,21 +297,13 @@ def extract_serie_folio_from_filename(path: Path) -> tuple[Optional[str], Option
 
 
 def extract_serie_folio(text: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    Intenta detectar SERIE / NUMERO evitando confundir RUTs, CAE, etc.
-    Solo acepta folios de 3 a 8 dígitos.
-    """
     if not text:
         return None, None
 
     patterns = [
-        # SERIE <A> ... NUMERO <1234567>
         r"\bSERIE\b[^A-Z0-9]{0,20}([A-Z])\b.*?\bNUMERO\b[^0-9]{0,20}(\d{3,})",
-        # SERIE <A> <1234567>
         r"\bSERIE\b[^A-Z0-9]{0,20}([A-Z])\s*([0-9]{3,})",
-        # NUMERO <A> <1234567>
         r"\bNUMERO\b[^A-Z0-9]{0,20}([A-Z])\s*([0-9]{3,})",
-        # fallback genérico: A-1234567
         r"\b([A-Z])\s*-?\s*(\d{3,})\b",
     ]
 
@@ -325,7 +314,6 @@ def extract_serie_folio(text: str) -> tuple[Optional[str], Optional[str]]:
         serie = m.group(1).upper()
         folio_raw = m.group(2)
         digits = re.sub(r"\D", "", folio_raw)
-        # Evitar folios absurdos (RUTs, CAE largos, etc.)
         if not (3 <= len(digits) <= 8):
             continue
         folio = digits.lstrip("0") or "0"
@@ -335,15 +323,11 @@ def extract_serie_folio(text: str) -> tuple[Optional[str], Optional[str]]:
 
 
 def extract_iva_total(text: str) -> Optional[float]:
-    """
-    Busca IVA total o suma IVA 10% + IVA 22%.
-    Tolera OCR sucio (valores sin separadores y "22%" leídos como "224").
-    """
     if not text:
         return None
     up = _safe_upper(text)
 
-    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE.pattern
+    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE_ANY.pattern
 
     m = re.search(r"\bTOTAL\s*IVA\b[^0-9\-]{0,20}((?:" + money_pat + r"))", up)
     if m:
@@ -363,7 +347,6 @@ def extract_iva_total(text: str) -> Optional[float]:
 
     if iva10 is None:
         iva10 = _money_after(r"\bI\.?V\.?A\.?\s*10\d?\D{0,15}(" + money_pat + r")")
-
     if iva22 is None:
         iva22 = _money_after(r"\bI\.?V\.?A\.?\s*22\d?\D{0,15}(" + money_pat + r")")
 
@@ -379,7 +362,7 @@ def extract_total(text: str) -> Optional[float]:
 
     candidates: list[tuple[float, int]] = []
 
-    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE.pattern
+    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE_TOTAL.pattern
 
     def _collect(pattern: str, score: int) -> None:
         for m in re.finditer(pattern, text, flags=re.I):
@@ -387,7 +370,6 @@ def extract_total(text: str) -> Optional[float]:
             if v is not None:
                 candidates.append((v, score))
 
-    # Total a pagar / Total:
     _collect(r"\bTOTAL\s*A\s*PAGAR\b[^0-9\-]{0,25}((?:" + money_pat + r"))", 100)
     _collect(r"\bTOTAL\b(?!\s*IVA)(?!\s*A\s*PAGAR)[^0-9\-]{0,25}((?:" + money_pat + r"))", 70)
     _collect(r"\bTOTAL\s*:\s*\$?\s*((?:" + money_pat + r"))", 75)
@@ -396,6 +378,7 @@ def extract_total(text: str) -> Optional[float]:
         candidates.sort(key=lambda t: (t[1], t[0]), reverse=True)
         return candidates[0][0]
 
+    # fallback: mayor valor "normal" que aparezca
     vals = [parse_money_with_fallback(m.group(1)) for m in MONEY_RE.finditer(text)]
     vals = [v for v in vals if v is not None]
     if not vals:
@@ -403,36 +386,66 @@ def extract_total(text: str) -> Optional[float]:
     return max(vals)
 
 
-def extract_subtotal(text: str) -> Optional[float]:
+def extract_rate_amount(text: str, rate: int, kind: str) -> Optional[float]:
     """
-    Detecta importe sin IVA a partir de etiquetas comunes.
-    Retorna el candidato POSITIVO más grande (es el que suele representar
-    el subtotal gravado principal).
+    kind:
+      - "gravado": busca "Subtotal gravado (22%) X"
+      - "iva": busca "Total iva (22%) X"
     """
     if not text:
         return None
+    up = _safe_upper(text)
+    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE_TOTAL.pattern
 
-    money_pat = MONEY_RE.pattern + "|" + MONEY_RE_LOOSE.pattern
-    labels = [
-        r"SUBTOTAL",
-        r"TOTAL\s+SIN\s+IVA",
-        r"IMPORTE\s+NETO",
-        r"NETO\s+GRAVADO",
-        r"TOTAL\s+EXENTO",
-    ]
+    if kind == "gravado":
+        patterns = [
+            rf"\bSUBTOTAL\s+GRAVADO\b.{0,40}\b{rate}\b.{0,10}[%\)]?.{{0,20}}((?:{money_pat}))",
+            rf"\bNETO\s+GRAVADO\b.{0,40}\b{rate}\b.{0,10}[%\)]?.{{0,20}}((?:{money_pat}))",
+        ]
+    else:  # iva
+        patterns = [
+            rf"\bTOTAL\s+IVA\b.{0,40}\b{rate}\b.{0,10}[%\)]?.{{0,20}}((?:{money_pat}))",
+            rf"\bI\.?V\.?A\.?\b.{0,20}\b{rate}\b.{0,10}[%\)]?.{{0,20}}((?:{money_pat}))",
+        ]
 
-    candidates: list[float] = []
-
-    for label in labels:
-        pattern = rf"\b{label}\b[^0-9\-]{{0,40}}((?:{money_pat}))"
-        for m in re.finditer(pattern, text, flags=re.I):
+    for pat in patterns:
+        m = re.search(pat, up, flags=re.S)
+        if m:
             v = parse_money_with_fallback(m.group(1))
-            if v is not None and v > 0:
-                candidates.append(v)
+            if v is not None:
+                return v
+    return None
 
-    if not candidates:
+
+def detect_single_tax_rate(text: str) -> Optional[float]:
+    """
+    Devuelve 0.22 o 0.10 si parece que el documento usa solo una tasa (o la otra es 0,00).
+    """
+    if not text:
         return None
-    return max(candidates)
+    up = _safe_upper(text)
+
+    g10 = extract_rate_amount(up, 10, "gravado")
+    g22 = extract_rate_amount(up, 22, "gravado")
+    i10 = extract_rate_amount(up, 10, "iva")
+    i22 = extract_rate_amount(up, 22, "iva")
+
+    def _nz(x: Optional[float]) -> bool:
+        return x is not None and abs(x) > 0.0001
+
+    # Si hay evidencia de 10 y 22 no-cero -> no podemos asumir tasa única
+    if (_nz(g10) or _nz(i10)) and (_nz(g22) or _nz(i22)):
+        return None
+
+    # Si 22 aparece y 10 es 0 o no aparece
+    if ("22" in up or "224" in up) and not (_nz(g10) or _nz(i10)):
+        return 0.22
+
+    # Si 10 aparece y 22 no aparece/no-cero
+    if "10" in up and not (_nz(g22) or _nz(i22)):
+        return 0.10
+
+    return None
 
 
 # ---------------------------
@@ -493,9 +506,13 @@ class OCRBackend:
             raise RuntimeError("Falta pillow (PIL) para OCR de imágenes.")
 
         img = self._preprocess_image(img)
-        errors: list[str] = []
 
-        for backend in self._iter_backends():
+        backends = self._iter_backends()
+        if not backends:
+            raise RuntimeError("No hay backend OCR disponible. Instalá easyocr (+torch) o pytesseract + tesseract.")
+
+        errors: list[str] = []
+        for backend in backends:
             try:
                 if backend == "easyocr":
                     txt = self.ocr_image_easy(img)
@@ -507,10 +524,7 @@ class OCRBackend:
             except Exception as exc:  # pragma: no cover
                 errors.append(f"{backend}: {exc}")
 
-        if errors:
-            raise RuntimeError("; ".join(errors))
-
-        raise RuntimeError("No hay backend OCR disponible. Instalá easyocr (+torch) o pytesseract + tesseract.")
+        raise RuntimeError("; ".join(errors) if errors else "OCR falló por razones misteriosas (clásico).")
 
 
 def crop_rel(img, l: float, t: float, r: float, b: float):
@@ -565,54 +579,47 @@ def parse_invoice_from_text(
     razon = derive_razon_social_from_filename(path)
     es_nc = is_credit_note(text_full, path)
 
-    # Serie / folio desde texto
-    serie, folio = extract_serie_folio(text_header or text_full)
+    # SERIE/FOLIO: intentar header -> full; luego filename.
+    serie, folio = extract_serie_folio(text_header) if text_header else (None, None)
+    if not serie or not folio:
+        serie, folio = extract_serie_folio(text_full)
 
-    # Fallback: si quedó vacío o folio parece un RUT, probar nombre de archivo
-    if not serie or not folio or _looks_like_rut(folio):
-        serie2, folio2 = extract_serie_folio_from_filename(path)
-        if serie2 and folio2:
-            serie, folio = serie2, folio2
+    if not serie or not folio:
+        s2, f2 = extract_serie_folio_from_filename(path)
+        if s2 and f2:
+            serie, folio = s2, f2
 
     serie_y_folio = f"{serie}-{folio}" if serie and folio else None
 
-    rut_emisor = extract_rut_emisor(text_header or text_full)
-    fecha = pick_best_date(text_header or text_full)
+    # RUT EMISOR: priorizar texto completo (header es el que suele “alucinar” números)
+    rut_emisor = extract_rut_emisor(text_full) or extract_rut_emisor(text_header)
 
-    subtotal_label = extract_subtotal(text_totals) or extract_subtotal(text_full)
+    # FECHA: extractor dedicado
+    fecha = extract_fecha_documento(text_full) or extract_fecha_documento(text_header)
+
+    # Totales/IVA
     total_num = extract_total(text_totals) or extract_total(text_full)
     iva_total_raw = extract_iva_total(text_totals) or extract_iva_total(text_full)
 
-    # Lógica para confiar (o no) en los IVA/subtotales
-    iva_total: Optional[float] = None
     sin_iva_num: Optional[float] = None
     sin_iva_fuente: Optional[str] = None
 
-    if total_num is not None:
-        # Caso 1: tenemos subtotal etiquetado + IVA
-        if subtotal_label is not None and iva_total_raw is not None:
-            if 0 < subtotal_label < total_num and 0 < iva_total_raw < total_num:
-                if abs((subtotal_label + iva_total_raw) - total_num) <= max(0.05, total_num * 0.01):
-                    # Cierra razonablemente -> confiable
-                    iva_total = round(iva_total_raw, 2)
-                    sin_iva_num = round(subtotal_label, 2)
-                    sin_iva_fuente = "subtotal_label"
+    # 1) Si IVA parece coherente, usar total - iva
+    if total_num is not None and iva_total_raw is not None:
+        if 0 < iva_total_raw < total_num:
+            base = total_num - iva_total_raw
+            if base > 0:
+                ratio = iva_total_raw / base
+                if 0.03 <= ratio <= 0.35:  # tolerante
+                    sin_iva_num = round(base, 2)
+                    sin_iva_fuente = "total_menos_iva"
 
-        # Caso 2: no confiamos en subtotal, pero el IVA aislado parece coherente
-        if iva_total is None and iva_total_raw is not None:
-            if 0 < iva_total_raw < total_num:
-                base = total_num - iva_total_raw
-                if base > 0:
-                    ratio = iva_total_raw / base
-                    # Rango razonable de IVA efectivo (5% a 30%)
-                    if 0.05 <= ratio <= 0.30:
-                        iva_total = round(iva_total_raw, 2)
-                        sin_iva_num = round(base, 2)
-                        sin_iva_fuente = "total_menos_iva"
-
-    # Si nada fue confiable, dejamos sin_iva como None
-    total_str = format_money_uy(total_num)
-    sin_iva_str = format_money_uy(sin_iva_num)
+    # 2) Si no, y parece haber tasa única, usar total/(1+tasa)
+    if sin_iva_num is None and total_num is not None:
+        rate = detect_single_tax_rate("\n".join([text_totals or "", text_full or ""]))
+        if rate in (0.10, 0.22):
+            sin_iva_num = round(total_num / (1.0 + rate), 2)
+            sin_iva_fuente = f"total_div_{int(rate*100)}"
 
     return InvoiceResult(
         fecha=fecha,
@@ -622,9 +629,9 @@ def parse_invoice_from_text(
         razon_social=razon,
         rut_emisor=rut_emisor,
         es_nota_de_credito=es_nc,
-        importe_total_con_iva=total_str,
+        importe_total_con_iva=format_money_uy(total_num),
         importe_total_con_iva_num=total_num,
-        importe_sin_iva=sin_iva_str,
+        importe_sin_iva=format_money_uy(sin_iva_num),
         importe_sin_iva_num=sin_iva_num,
         importe_sin_iva_fuente=sin_iva_fuente,
         _archivo=str(path),
@@ -637,7 +644,6 @@ def process_image(path: Path, ocr: OCRBackend, debug: bool) -> tuple[str, str, s
         raise RuntimeError("Falta pillow (PIL) para leer imágenes.")
     img = Image.open(path)
 
-    # Header: parte superior; totales: esquina inferior derecha (heurístico)
     header_img = crop_rel(img, 0.00, 0.00, 1.00, 0.38)
     totals_img = crop_rel(img, 0.50, 0.60, 1.00, 0.95)
 
@@ -707,13 +713,17 @@ def parse_path(root: Path, as_json: bool, debug: bool, preferred_backend: str) -
         except Exception as e:
             if debug:
                 print(f"[ERROR] {path.name}: {e}")
-            # Devolvemos al menos razón social y archivo
+
+            # Incluso si falla OCR, intentar sacar serie/folio del nombre para no perder todo
+            serie, folio = extract_serie_folio_from_filename(path)
+            serie_y_folio = f"{serie}-{folio}" if serie and folio else None
+
             results.append(
                 InvoiceResult(
                     fecha=None,
-                    serie=None,
-                    folio=None,
-                    serie_y_folio=None,
+                    serie=serie,
+                    folio=folio,
+                    serie_y_folio=serie_y_folio,
                     razon_social=derive_razon_social_from_filename(path),
                     rut_emisor=None,
                     es_nota_de_credito=is_credit_note("", path),
