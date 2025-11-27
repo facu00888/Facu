@@ -1,742 +1,545 @@
-# invoice_parser.py
-from __future__ import annotations
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import argparse
+import csv
 import json
-import math
 import os
 import re
 import sys
-import time
-import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ----------------------------
-# Resource limits (set EARLY)
-# ----------------------------
 
-def _set_thread_env(n: int) -> None:
-    n = max(1, int(n))
-    # Common BLAS/OpenMP knobs
-    os.environ.setdefault("OMP_NUM_THREADS", str(n))
-    os.environ.setdefault("MKL_NUM_THREADS", str(n))
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(n))
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(n))
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(n))
-    # Avoid GPU surprises
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# ---------------------------
+# Utilidades de parsing
+# ---------------------------
 
-# Suppress noisy torch/easyocr warning you keep seeing
-warnings.filterwarnings("ignore", message=r".*pin_memory.*no accelerator.*", category=UserWarning)
-
-# ----------------------------
-# Optional dependencies
-# ----------------------------
-
-def _try_import_cv2():
-    try:
-        import cv2  # type: ignore
-        return cv2
-    except Exception:
-        return None
-
-def _try_import_numpy():
-    try:
-        import numpy as np  # type: ignore
-        return np
-    except Exception:
-        return None
-
-def _try_import_easyocr():
-    try:
-        import easyocr  # type: ignore
-        return easyocr
-    except Exception:
-        return None
-
-def _try_import_pypdf():
-    try:
-        from pypdf import PdfReader  # type: ignore
-        return PdfReader
-    except Exception:
-        return None
-
-def _try_import_psutil():
-    try:
-        import psutil  # type: ignore
-        return psutil
-    except Exception:
-        return None
-
-
-# ----------------------------
-# Helpers: parsing & scoring
-# ----------------------------
-
-_RE_DATE = re.compile(r"\b([0-3]?\d)[/.\-]([01]?\d)[/.\-]((?:19|20)\d{2})\b")
-_RE_RUT12 = re.compile(r"\b(\d{12})\b")
-# Matches amounts like: 8.516,99 | 4 018,01 | 785,06 | 6491.78 (less common)
-_RE_AMOUNT = re.compile(
-    r"\b(\d{1,3}(?:[.\s]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))\b"
-)
+RUT_RE = re.compile(r"\b(\d{12})\b")
+DATE_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")
+MONEY_RE = re.compile(r"[-]?\d{1,3}(?:\.\d{3})*(?:,\d{2})|[-]?\d+(?:,\d{2})")
 
 def norm_text(s: str) -> str:
-    s = s.replace("\u00a0", " ")
+    # Normaliza whitespace pero conserva saltos de línea (útil para "línea siguiente")
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # colapsa espacios y tabs
     s = re.sub(r"[ \t]+", " ", s)
+    # colapsa muchas líneas vacías
+    s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-def upper_clean(s: str) -> str:
-    s = norm_text(s)
-    return s.upper()
+def norm_space(s: str) -> str:
+    # Para regex donde no importa el salto de línea
+    return re.sub(r"\s+", " ", s).strip()
 
-def parse_amount_to_float(raw: str) -> Optional[float]:
+def parse_uy_money_to_float(val: str) -> Optional[float]:
     """
-    Uruguay style is usually thousands '.' or space, decimals ','.
-    Handles:
-      - "4 018,01" -> 4018.01
-      - "8.516,99" -> 8516.99
-      - "6491,78" -> 6491.78
-      - "6491.78" -> 6491.78
+    "4.924,04" -> 4924.04
+    "6046,00" -> 6046.0
     """
-    if not raw:
+    if not val:
         return None
-    s = raw.strip()
-    s = s.replace("UYU", "").replace("$", "").replace(" ", "")
-    s = re.sub(r"[^\d,\.]", "", s)
-
-    if not s:
-        return None
-
-    # both '.' and ',' -> assume '.' thousands, ',' decimals
-    if "." in s and "," in s:
-        s = s.replace(".", "")
-        s = s.replace(",", ".")
-    elif "," in s and "." not in s:
-        # assume comma decimals
-        s = s.replace(",", ".")
-    else:
-        # only dots or only digits
-        # if multiple dots and last chunk length == 2 -> decimal dot, others thousands
-        if s.count(".") >= 2:
-            parts = s.split(".")
-            if len(parts[-1]) == 2:
-                s = "".join(parts[:-1]) + "." + parts[-1]
-            else:
-                s = s.replace(".", "")
-
+    v = val.strip()
+    v = v.replace(".", "").replace(",", ".")
     try:
-        val = float(s)
-        if not math.isfinite(val):
-            return None
-        return val
-    except Exception:
+        return float(v)
+    except ValueError:
         return None
 
-def extract_dates_with_scores(text: str, current_year: int) -> List[Tuple[str, int]]:
-    t = text
-    out: List[Tuple[str, int]] = []
-    for m in _RE_DATE.finditer(t):
-        d, mo, y = m.group(1), m.group(2), m.group(3)
-        date = f"{int(d):02d}/{int(mo):02d}/{y}"
-        ctx0 = max(0, m.start() - 35)
-        ctx1 = min(len(t), m.end() + 35)
-        ctx = upper_clean(t[ctx0:ctx1])
-
-        score = 0
-        if "FECHA DE DOCUMENTO" in ctx or "FECHA DOCUMENTO" in ctx:
-            score += 8
-        elif "FECHA" in ctx:
-            score += 5
-
-        if "VENC" in ctx or "VENCIMIENTO" in ctx:
-            score -= 8
-        if "CAE" in ctx or "CAI" in ctx:
-            score -= 6
-
-        year = int(y)
-        # To avoid picking CAE vencimiento 2027 when docs are 2025, etc.
-        if year > current_year + 1:
-            score -= 4
-
-        out.append((date, score))
-    return out
-
-def choose_best_date(text: str, current_year: int) -> Optional[str]:
-    cand = extract_dates_with_scores(text, current_year)
-    if not cand:
-        return None
-    cand.sort(key=lambda x: (x[1], x[0]), reverse=True)
-    best_score = cand[0][1]
-    # If tie-ish, prefer the earliest date (usually doc date <= due date)
-    top = [c for c in cand if c[1] == best_score]
-    top.sort(key=lambda x: x[0])
-    return top[0][0]
-
-def extract_rut_emisor(text: str) -> Optional[str]:
-    t = text
-    best: Tuple[str, int] | None = None
-    for m in _RE_RUT12.finditer(t):
-        rut = m.group(1)
-        ctx0 = max(0, m.start() - 30)
-        ctx1 = min(len(t), m.end() + 30)
-        ctx = upper_clean(t[ctx0:ctx1])
-        score = 0
-        if "RUT EMISOR" in ctx or "RUC EMISOR" in ctx:
-            score += 10
-        if "RUC" in ctx or "RUT" in ctx:
-            score += 6
-        if "COMPRADOR" in ctx or "RECEPTOR" in ctx:
-            score -= 6
-        if best is None or score > best[1]:
-            best = (rut, score)
-    return best[0] if best else None
-
-def _iter_lines(text: str) -> List[str]:
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-    return lines
-
-def extract_total_amount(text: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
-    """
-    Returns (raw_string, float_value, fuente)
-    """
-    lines = _iter_lines(text)
-    up_lines = [upper_clean(l) for l in lines]
-    best: Tuple[Optional[str], Optional[float], int, str] = (None, None, -10_000, "none")
-
-    def consider(line: str, idx: int, fuente: str) -> None:
-        nonlocal best
-        up = upper_clean(line)
-        # Extract all amount-looking tokens from line
-        toks = _RE_AMOUNT.findall(line)
-        for tok in toks:
-            val = parse_amount_to_float(tok)
-            if val is None:
-                continue
-
-            score = 0
-            if "TOTAL A PAGAR" in up or "TOTAL APAGAR" in up:
-                score += 14
-            elif "TOTAL" in up:
-                score += 10
-            if "A PAGAR" in up:
-                score += 6
-            if "SUBTOTAL" in up:
-                score -= 7
-            if "IVA" in up and "TOTAL" not in up:
-                score -= 4
-            if "CAE" in up or "CAI" in up:
-                score -= 5
-
-            # Prefer bottom-ish
-            if len(lines) > 0:
-                pos = idx / max(1, (len(lines) - 1))
-                if pos > 0.65:
-                    score += 3
-
-            # If this looks like a tiny line item total and we have bigger candidates later, scoring will handle.
-            # But still, avoid absurdly tiny totals:
-            if val < 1:
-                score -= 5
-
-            # Update best: score first, then bigger amount
-            if (score > best[2]) or (score == best[2] and (best[1] is None or val > best[1])):
-                best = (tok, val, score, fuente)
-
-    # 1) Strong labels first
-    for i, ln in enumerate(lines):
-        up = up_lines[i]
-        if any(k in up for k in ["TOTAL A PAGAR", "TOTAL", "A PAGAR", "IMPORTE TOTAL"]):
-            consider(ln, i, "line_label")
-
-    # 2) If nothing found with a label, consider all lines but penalize
-    if best[1] is None:
-        for i, ln in enumerate(lines):
-            consider(ln, i, "line_any")
-
-    # 3) If still nothing, scan whole text tokens
-    if best[1] is None:
-        for m in _RE_AMOUNT.finditer(text):
-            tok = m.group(1)
-            val = parse_amount_to_float(tok)
-            if val is None:
-                continue
-            score = 0
-            if val < 1:
-                score -= 5
-            if score > best[2] or (score == best[2] and (best[1] is None or val > best[1])):
-                best = (tok, val, score, "global_fallback")
-
-    if best[1] is None:
-        return None, None, None
-    return best[0], best[1], best[3]
-
-def extract_serie_folio(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Tries to find Serie (single letter) and Folio/Numero (4-8 digits).
-    Avoids confusing 12-digit RUT with folio.
-    """
-    t = text
-    up = upper_clean(t)
-
-    # Pattern like: "SERIE NUMERO ... A 049009"
-    m = re.search(r"(SERIE|BERIE|SER1E)\s*(NUMERO|N[UO]MERO)[^\n]{0,80}\b([A-Z])\s*([0-9]{4,8})\b", up)
-    if m:
-        return m.group(3), m.group(4)
-
-    # Pattern like: "... SERIE A NUMERO 3519972"
-    m = re.search(r"(SERIE|BERIE|SER1E)[^\n]{0,40}\b([A-Z])\b[^\n]{0,40}(NUMERO|N[UO]MERO)[^\n]{0,40}\b([0-9]{4,8})\b", up)
-    if m:
-        return m.group(2), m.group(4)
-
-    # Pattern like "A 3519972" near words that suggest document number
-    candidates: List[Tuple[str, str, int]] = []
-
-    for m in re.finditer(r"\b([A-Z])\s*[-:]?\s*([0-9]{4,8})\b", up):
-        serie, folio = m.group(1), m.group(2)
-        ctx0 = max(0, m.start() - 40)
-        ctx1 = min(len(up), m.end() + 40)
-        ctx = up[ctx0:ctx1]
-        score = 0
-        if "SERIE" in ctx or "BERIE" in ctx:
-            score += 7
-        if "NUMERO" in ctx or "NOMERO" in ctx:
-            score += 7
-        if "DOCUMENTO" in ctx or "FACTURA" in ctx or "E-FACTURA" in ctx:
-            score += 4
-        if "RUC" in ctx or "RUT" in ctx or "COMPRADOR" in ctx or "RECEPTOR" in ctx:
-            score -= 8
-        if "CAE" in ctx or "CAI" in ctx:
-            score -= 6
-        candidates.append((serie, folio, score))
-
-    # Also allow just number (folio) if series is missing (common OCR fail)
-    for m in re.finditer(r"\b([0-9]{4,8})\b", up):
-        folio = m.group(1)
-        ctx0 = max(0, m.start() - 35)
-        ctx1 = min(len(up), m.end() + 35)
-        ctx = up[ctx0:ctx1]
-        score = 0
-        if "NUMERO" in ctx or "NOMERO" in ctx:
-            score += 6
-        if "DOCUMENTO" in ctx or "FACTURA" in ctx or "E-FACTURA" in ctx:
-            score += 4
-        if "RUC" in ctx or "RUT" in ctx or "COMPRADOR" in ctx or "RECEPTOR" in ctx:
-            score -= 9
-        if "CAE" in ctx or "CAI" in ctx:
-            score -= 6
-        # Penalize super short numbers that are likely quantities
-        if len(folio) <= 4:
-            score -= 2
-        candidates.append((None, folio, score))  # type: ignore
-
-    if not candidates:
-        return None, None
-
-    candidates.sort(key=lambda x: x[2], reverse=True)
-    serie, folio, _ = candidates[0]
-    return serie, folio
-
-def detect_provider_name(text: str) -> Optional[str]:
-    up = upper_clean(text)
-    # quick win for your cases
-    if "BIMBO" in up:
-        return "BIMBO"
-    if "PURA PALTA" in up:
-        return "PURA PALTA SAS"
+def pick_first(lines: List[str], bad_prefixes: Tuple[str, ...]) -> Optional[str]:
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        up = t.upper()
+        if any(up.startswith(pfx) for pfx in bad_prefixes):
+            continue
+        # Filtra líneas demasiado “genéricas”
+        if up in {"RUT EMISOR TIPO DOCUMENTO", "SERIE NUMERO FORMA DE PAGO VENCIMIENTO"}:
+            continue
+        return t
     return None
 
+def line_after_label(text: str, label_re: re.Pattern) -> Optional[str]:
+    """
+    Busca label y devuelve la primera línea no vacía después del match.
+    """
+    m = label_re.search(text)
+    if not m:
+        return None
+    tail = text[m.end():]
+    for ln in tail.split("\n"):
+        ln = ln.strip()
+        if ln:
+            return ln
+    return None
 
-# ----------------------------
-# OCR + QR
-# ----------------------------
+def extract_money_after(label_regex: str, text_space: str) -> Optional[str]:
+    # label_regex debe estar escapado si hace falta
+    m = re.search(label_regex + r"\s*([-]?\d[\d\.\,]*)", text_space, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1)
+
+def safe_strip_paren_prefix(s: str) -> str:
+    # "(3532) MODELO..." -> "MODELO..."
+    return re.sub(r"^\(\d+\)\s*", "", s.strip())
+
+def parse_serie_numero_forma_venc(line: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Ejemplos:
+      "A 492520 Contado 26/11/2025"
+      "A 133716 Credito"
+    """
+    if not line:
+        return None, None, None, None
+
+    tokens = line.split()
+    if len(tokens) < 2:
+        return None, None, None, None
+
+    serie = tokens[0] if re.fullmatch(r"[A-Za-z]", tokens[0]) else None
+    folio = tokens[1] if re.fullmatch(r"\d{1,10}", tokens[1]) else None
+
+    venc = None
+    if tokens and DATE_RE.fullmatch(tokens[-1]):
+        venc = tokens[-1]
+        forma_tokens = tokens[2:-1]
+    else:
+        forma_tokens = tokens[2:]
+
+    forma = " ".join(forma_tokens).strip() if forma_tokens else None
+    return serie, folio, forma, venc
+
+def parse_pais_fecha_moneda(line: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    "UY 26/11/2025 Peso Uruguayo"
+    """
+    if not line:
+        return None, None, None
+    tokens = line.split()
+    if len(tokens) < 2:
+        return None, None, None
+    pais = tokens[0]
+    fecha = tokens[1] if DATE_RE.fullmatch(tokens[1]) else None
+    moneda = " ".join(tokens[2:]).strip() if len(tokens) > 2 else None
+    return pais, fecha, moneda
+
+
+# ---------------------------
+# Modelo de salida
+# ---------------------------
 
 @dataclass
-class OCRConfig:
-    mode: str
-    cpu_threads: int
-    max_dim: int
-    max_pixels: int
+class InvoiceOut:
+    fecha: Optional[str] = None
+    serie: Optional[str] = None
+    folio: Optional[str] = None
+    serie_y_folio: Optional[str] = None
 
-def _resize_guard(cv2, np, img, max_dim: int, max_pixels: int):
-    h, w = img.shape[:2]
-    if h <= 0 or w <= 0:
-        return img
+    razon_social: Optional[str] = None            # emisor (mejor que nada)
+    razon_social_receptor: Optional[str] = None
+    rut_emisor: Optional[str] = None
+    rut_receptor: Optional[str] = None
+    tipo_documento: Optional[str] = None
+    forma_pago: Optional[str] = None
+    vencimiento: Optional[str] = None
+    moneda: Optional[str] = None
 
-    # scale by max_dim first
-    scale = 1.0
-    if max(h, w) > max_dim:
-        scale = max_dim / float(max(h, w))
+    importe_total_con_iva: Optional[str] = None
+    importe_total_con_iva_num: Optional[float] = None
 
-    # scale by max_pixels too
-    if h * w * (scale ** 2) > max_pixels:
-        scale2 = math.sqrt(max_pixels / float(h * w))
-        scale = min(scale, scale2)
+    importe_sin_iva: Optional[str] = None
+    importe_sin_iva_num: Optional[float] = None
+    importe_sin_iva_fuente: Optional[str] = None
 
-    if scale < 0.999:
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    return img
+    es_nota_de_credito: bool = False
 
-def preprocess_for_ocr(cv2, np, img_bgr, mode: str):
-    """
-    Returns grayscale-ish binary/contrast version depending on mode.
-    """
-    img = img_bgr.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _archivo: Optional[str] = None
+    _fuente: Optional[str] = None
+    _debug: Optional[Dict[str, Any]] = None
 
-    if mode == "fast":
-        # light touch
-        gray = cv2.GaussianBlur(gray, (3, 3), 0)
-        return gray
 
-    # balanced / accurate:
-    # equalize + denoise
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    eq = clahe.apply(gray)
-    eq = cv2.bilateralFilter(eq, 7, 60, 60)
+# ---------------------------
+# PDF text parsing (DGI-style)
+# ---------------------------
 
-    if mode == "accurate":
-        th = cv2.adaptiveThreshold(eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY, 31, 7)
-        # small morphology to connect characters
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, k, iterations=1)
-        return th
+LABEL_RUT_EMISOR = re.compile(r"RUT\s*EMISOR\s*TIPO\s*DOCUMENTO", re.IGNORECASE)
+LABEL_SERIE_NUM = re.compile(r"SERIE\s*NUMERO\s*FORMA\s*DE\s*PAGO\s*VENCIMIENTO", re.IGNORECASE)
+LABEL_RUT_RECEPTOR = re.compile(r"RUT\s*RECEPTOR\s*RAZON\s*SOCIAL", re.IGNORECASE)
+LABEL_PAIS_FECHA_MONEDA = re.compile(r"PAIS\s*FECHA\s*DE\s*DOCUMENTO\s*MONEDA", re.IGNORECASE)
 
-    # balanced
-    th = cv2.adaptiveThreshold(eq, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY, 25, 9)
-    return th
+def parse_dgi_pdf_text(text: str, debug: bool = False) -> InvoiceOut:
+    raw = text
+    text = norm_text(text)
+    space = norm_space(text)
 
-def decode_qr_from_image(cv2, np, img_bgr) -> Optional[str]:
+    out = InvoiceOut()
+    dbg: Dict[str, Any] = {}
+
+    # “Razón social” emisor: primera línea relevante
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    out.razon_social = pick_first(
+        lines,
+        bad_prefixes=(
+            "RUT EMISOR", "SERIE NUMERO", "RUT RECEPTOR", "DIRECCION",
+            "PAIS FECHA", "CONCEPTO", "SUBTOTAL", "TOTAL", "CODIGO", "OBSERVACIONES"
+        )
+    )
+
+    # Rut emisor + tipo documento en línea siguiente de la etiqueta
+    line = line_after_label(text, LABEL_RUT_EMISOR)
+    if line:
+        # Ej: "215412670012 e-Factura"
+        m = re.match(r"(\d{12})\s+(.+)$", line.strip())
+        if m:
+            out.rut_emisor = m.group(1)
+            out.tipo_documento = m.group(2).strip()
+
+    # Serie/numero/forma/venc
+    sn_line = line_after_label(text, LABEL_SERIE_NUM)
+    serie, folio, forma, venc = parse_serie_numero_forma_venc(sn_line or "")
+    out.serie = serie
+    out.folio = folio
+    out.forma_pago = forma
+    out.vencimiento = venc
+
+    # Receptor
+    rr_line = line_after_label(text, LABEL_RUT_RECEPTOR)
+    if rr_line:
+        # Ej: "218849400010 (3532) MODELO NATURAL SRL"
+        m = re.match(r"(\d{12})\s*(.*)$", rr_line.strip())
+        if m:
+            out.rut_receptor = m.group(1)
+            out.razon_social_receptor = safe_strip_paren_prefix(m.group(2))
+
+    # País/fecha/moneda (fecha del documento)
+    pfm_line = line_after_label(text, LABEL_PAIS_FECHA_MONEDA)
+    pais, fecha_doc, moneda = parse_pais_fecha_moneda(pfm_line or "")
+    out.fecha = fecha_doc or out.fecha
+    out.moneda = moneda
+
+    # Total a pagar
+    total_str = extract_money_after(r"Total\s+a\s+pagar", space)
+    if total_str:
+        out.importe_total_con_iva = total_str
+        out.importe_total_con_iva_num = parse_uy_money_to_float(total_str)
+
+    # IVA y subtotales para neto (sin IVA)
+    sub10 = extract_money_after(r"Subtotal\s+gravado\s*\(10%\)", space)
+    iva10 = extract_money_after(r"Total\s+iva\s*\(10%\)", space)
+    sub22 = extract_money_after(r"Subtotal\s+gravado\s*\(22%\)", space)
+    iva22 = extract_money_after(r"Total\s+iva\s*\(22%\)", space)
+    sub_nogr = extract_money_after(r"Subtotal\s+no\s+gravado", space)
+
+    dbg["sub10"] = sub10
+    dbg["iva10"] = iva10
+    dbg["sub22"] = sub22
+    dbg["iva22"] = iva22
+    dbg["sub_no_gravado"] = sub_nogr
+    dbg["sn_line"] = sn_line
+    dbg["rr_line"] = rr_line
+    dbg["pfm_line"] = pfm_line
+
+    net_candidates: List[Tuple[str, Optional[float]]] = []
+
+    def f(x: Optional[str]) -> Optional[float]:
+        return parse_uy_money_to_float(x) if x else None
+
+    # Neto por suma de subtotales (mejor si existen)
+    s10, s22, sng = f(sub10), f(sub22), f(sub_nogr)
+    if s10 is not None and s22 is not None:
+        net = (s10 or 0.0) + (s22 or 0.0) + (sng or 0.0)
+        net_candidates.append(("subtotales", net))
+
+    # Neto por total - IVA (fallback)
+    t = out.importe_total_con_iva_num
+    i10, i22 = f(iva10), f(iva22)
+    if t is not None and i10 is not None and i22 is not None:
+        net_candidates.append(("total_menos_iva", t - i10 - i22))
+
+    # Elegí la fuente más “confiable”
+    chosen = None
+    if net_candidates:
+        # prioriza subtotales
+        net_candidates.sort(key=lambda x: 0 if x[0] == "subtotales" else 1)
+        chosen = net_candidates[0]
+
+    if chosen and chosen[1] is not None:
+        out.importe_sin_iva_num = round(chosen[1], 2)
+        # formatea a "es-uy" para mantener consistencia
+        out.importe_sin_iva = f"{out.importe_sin_iva_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        out.importe_sin_iva_fuente = chosen[0]
+
+    # Nota de crédito (heurística)
+    out.es_nota_de_credito = bool(re.search(r"nota\s+de\s+cr[eé]dito", space, flags=re.IGNORECASE))
+
+    if out.serie and out.folio:
+        out.serie_y_folio = f"{out.serie}-{out.folio}"
+
+    if debug:
+        out._debug = dbg
+
+    return out
+
+
+# ---------------------------
+# Lectura de PDF (texto real)
+# ---------------------------
+
+def extract_pdf_text(path: Path) -> str:
+    import pdfplumber  # lazy import
+    parts: List[str] = []
+    with pdfplumber.open(str(path)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t.strip():
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+def pdf_has_useful_text(text: str) -> bool:
+    if not text or len(text.strip()) < 40:
+        return False
+    s = norm_space(text).upper()
+    # etiquetas DGI típicas
+    return ("RUT EMISOR" in s and "SERIE" in s and "TOTAL A PAGAR" in s) or ("RUT EMISOR" in s and "TIPO DOCUMENTO" in s)
+
+
+# ---------------------------
+# OCR (opcional y perezoso)
+# ---------------------------
+
+def set_low_priority_if_possible():
+    # Windows: intenta bajar prioridad sin romper nada
     try:
-        det = cv2.QRCodeDetector()
-        data, _, _ = det.detectAndDecode(img_bgr)
-        data = (data or "").strip()
-        if data:
-            return data
-        # try on grayscale (sometimes helps)
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        data, _, _ = det.detectAndDecode(gray)
-        data = (data or "").strip()
-        return data or None
+        import psutil  # type: ignore
+        p = psutil.Process(os.getpid())
+        p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # Windows
+        return
     except Exception:
-        return None
+        pass
+    # fallback: nada
 
-def ocr_image_easyocr(image_path: Path, cfg: OCRConfig, debug: bool = False) -> Tuple[str, str]:
-    """
-    Returns (full_text, source_label)
-    """
-    cv2 = _try_import_cv2()
-    np = _try_import_numpy()
-    easyocr = _try_import_easyocr()
-    if cv2 is None or np is None:
-        raise RuntimeError("Falta opencv-python o numpy. Instalá: pip install opencv-python numpy")
-    if easyocr is None:
-        raise RuntimeError("Falta easyocr. Instalá: pip install easyocr")
+def ocr_image_easyocr(image_path: Path, cpu_threads: int = 1) -> str:
+    # Importes lazies para no cargar torch si no hace falta
+    os.environ.setdefault("OMP_NUM_THREADS", str(cpu_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(cpu_threads))
 
-    # OpenCV thread limit
     try:
-        cv2.setNumThreads(max(1, int(cfg.cpu_threads)))
+        import torch  # type: ignore
+        torch.set_num_threads(max(1, cpu_threads))
     except Exception:
         pass
 
-    img = cv2.imread(str(image_path))
-    if img is None:
-        raise RuntimeError("No se pudo leer la imagen (cv2.imread devolvió None)")
-
-    img = _resize_guard(cv2, np, img, cfg.max_dim, cfg.max_pixels)
-
-    # QR first (best case)
-    qr = decode_qr_from_image(cv2, np, img)
-    if qr:
-        # Treat QR payload as extra text source added up front
-        if debug:
-            print(f"[QR] {image_path.name}: {qr}")
-        # Still do OCR too, but QR gets appended (so extractor sees it)
-        qr_text = f"\nQR_DATA: {qr}\n"
-    else:
-        qr_text = ""
-
-    proc = preprocess_for_ocr(cv2, np, img, cfg.mode)
-
-    # Build reader once per call (simple); you can optimize to cache if wanted.
-    # Spanish+English helps with "Fecha/Total" etc.
     try:
-        reader = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
-    except Exception as e:
-        raise RuntimeError(f"EasyOCR no pudo inicializarse: {e}")
-
-    # detail=0 returns just strings
-    try:
-        results = reader.readtext(proc, detail=0, paragraph=True)
-    except Exception:
-        # fallback: try without preprocessing
-        results = reader.readtext(img, detail=0, paragraph=True)
-
-    text = "\n".join([norm_text(r) for r in results if norm_text(r)])
-    text = (qr_text + text).strip()
-    if not text:
-        raise RuntimeError("OCR falló: no se obtuvo texto útil.")
-    return text, "image_ocr_easyocr"
-
-def extract_text_from_pdf(pdf_path: Path) -> Tuple[str, str]:
-    PdfReader = _try_import_pypdf()
-    if PdfReader is None:
-        raise RuntimeError("Falta pypdf. Instalá: pip install pypdf")
-    reader = PdfReader(str(pdf_path))
-    texts: List[str] = []
-    for page in reader.pages:
+        import cv2  # type: ignore
         try:
-            t = page.extract_text() or ""
+            cv2.setNumThreads(max(1, cpu_threads))
         except Exception:
-            t = ""
-        t = t.strip()
-        if t:
-            texts.append(t)
-    full = "\n".join(texts).strip()
-    if not full:
-        raise RuntimeError("PDF sin texto extraíble (parece escaneado).")
-    return full, "pdf_text"
+            pass
+    except Exception:
+        cv2 = None  # noqa
+
+    import numpy as np  # type: ignore
+    from PIL import Image  # type: ignore
+    import easyocr  # type: ignore
+
+    img = Image.open(str(image_path)).convert("RGB")
+    arr = np.array(img)
+
+    # Preprocesado mínimo (sin volver loco al CPU)
+    # Gris + umbral suave si cv2 está
+    if cv2 is not None:
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 31, 10)
+        arr = cv2.cvtColor(thr, cv2.COLOR_GRAY2RGB)
+
+    reader = easyocr.Reader(["es"], gpu=False)
+    result = reader.readtext(arr, detail=0, paragraph=True)
+    return "\n".join(result).strip()
 
 
-# ----------------------------
-# Gold / report
-# ----------------------------
+# ---------------------------
+# Reporte vs gold.json
+# ---------------------------
 
 def load_gold(path: Path) -> Dict[str, Dict[str, Any]]:
-    obj = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(obj, dict):
-        raise ValueError("gold.json debe ser un JSON objeto (diccionario).")
-    # keys should be filenames: "BIMBO A3519972 CREDITO.jpeg"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("gold.json debe ser un objeto JSON (dict) con keys=nombre_archivo.")
+    # values dicts
     out: Dict[str, Dict[str, Any]] = {}
-    for k, v in obj.items():
+    for k, v in data.items():
         if isinstance(v, dict):
             out[str(k)] = v
     return out
 
-def evaluate_against_gold(results: List[Dict[str, Any]], gold: Dict[str, Dict[str, Any]]) -> str:
-    # Match by basename
-    keyed = {Path(r.get("_archivo", "")).name: r for r in results if r.get("_archivo")}
-    gold_keys = [k for k in gold.keys() if k in keyed]
-    total = len(gold_keys)
-    lines = []
-    lines.append("\n=== REPORT ===")
-    lines.append(f"Docs con gold: {total}")
+def compare_with_gold(preds: List[InvoiceOut], gold: Dict[str, Dict[str, Any]]) -> None:
+    keys = ["fecha", "rut_emisor", "serie", "folio", "importe_total_con_iva_num"]
 
-    if total == 0:
-        return "\n".join(lines)
-
-    fields = ["fecha", "rut_emisor", "serie", "folio", "importe_total_con_iva_num"]
-    ok_counts = {f: 0 for f in fields}
-
+    total_docs = 0
+    hits = {k: 0 for k in keys}
     mismatches: List[str] = []
-    for fname in gold_keys:
-        pred = keyed[fname]
-        g = gold[fname]
-        diffs = []
-        for f in fields:
-            pv = pred.get(f)
-            gv = g.get(f)
-            if pv == gv:
-                ok_counts[f] += 1
-            else:
-                diffs.append((f, pv, gv))
-        if diffs:
-            chunk = [f"* {fname}"]
-            for f, pv, gv in diffs:
-                chunk.append(f"  - {f}: pred={pv!r} gold={gv!r}")
-            mismatches.append("\n".join(chunk))
 
-    for f in fields:
-        pct = 100.0 * ok_counts[f] / total
-        lines.append(f"{f}: {ok_counts[f]}/{total} ({pct:.1f}%)")
+    # Index preds por basename
+    pred_map: Dict[str, InvoiceOut] = {Path(p._archivo or "").name: p for p in preds}
+
+    for fname, g in gold.items():
+        total_docs += 1
+        p = pred_map.get(Path(fname).name)
+
+        for k in keys:
+            gv = g.get(k)
+            pv = getattr(p, k) if p is not None else None
+
+            # normaliza floats
+            if isinstance(gv, (int, float)) and isinstance(pv, (int, float)):
+                ok = abs(float(gv) - float(pv)) < 0.01
+            else:
+                ok = (pv == gv)
+
+            if ok:
+                hits[k] += 1
+            else:
+                mismatches.append(f"* {fname}\n  - {k}: pred={pv!r} gold={gv!r}")
+
+    print("\n=== REPORT ===")
+    print(f"Docs con gold: {total_docs}")
+    if total_docs == 0:
+        return
+    for k in keys:
+        pct = 100.0 * hits[k] / total_docs
+        print(f"{k}: {hits[k]}/{total_docs} ({pct:.1f}%)")
 
     if mismatches:
-        lines.append("\n--- MISMATCHES ---")
-        lines.extend(mismatches)
-    return "\n".join(lines)
+        print("\n--- MISMATCHES ---")
+        # imprime agrupado “bonito”
+        # (ya vienen en formato con * archivo)
+        seen = set()
+        for m in mismatches:
+            head = m.split("\n", 1)[0]
+            if head in seen:
+                continue
+            seen.add(head)
+            # imprime todas las líneas de ese archivo
+            bloc = [x for x in mismatches if x.startswith(head + "\n")]
+            print(head)
+            for b in bloc:
+                print(b.split("\n", 1)[1])
 
 
-# ----------------------------
-# Main extraction pipeline
-# ----------------------------
+# ---------------------------
+# Main
+# ---------------------------
 
-def extract_fields_from_text(text: str, filename: str, current_year: int) -> Dict[str, Any]:
-    text = text or ""
-    t = text.strip()
-
-    fecha = choose_best_date(t, current_year=current_year)
-    rut = extract_rut_emisor(t)
-    serie, folio = extract_serie_folio(t)
-
-    prov = detect_provider_name(t)
-
-    raw_total, total_num, total_src = extract_total_amount(t)
-
-    out = {
-        "fecha": fecha,
-        "serie": serie,
-        "folio": folio,
-        "serie_y_folio": (f"{serie}-{folio}" if serie and folio else None),
-        "razon_social": prov,  # best-effort
-        "rut_emisor": rut,
-        "es_nota_de_credito": False,
-        "importe_total_con_iva": raw_total,
-        "importe_total_con_iva_num": total_num,
-        "importe_sin_iva": None,
-        "importe_sin_iva_num": None,
-        "importe_sin_iva_fuente": None,
-        "_archivo": filename,
-        "_fuente": None,
-    }
-
-    # If we got a total and it's Uruguay VAT-ish, compute sin IVA as heuristic (only when clearly 22%)
-    if total_num is not None:
-        # divisors
-        sin_iva_22 = round(total_num / 1.22, 2)
-        out["importe_sin_iva"] = f"{sin_iva_22:.2f}".replace(".", ",")
-        out["importe_sin_iva_num"] = sin_iva_22
-        out["importe_sin_iva_fuente"] = "total_div_22"
-
-    return out
-
-def list_docs(folder: Path) -> List[Path]:
+def iter_files(path: Path) -> List[Path]:
+    if path.is_file():
+        return [path]
     exts = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-    files = []
-    for p in folder.rglob("*"):
+    files: List[Path] = []
+    for p in path.rglob("*"):
         if p.is_file() and p.suffix.lower() in exts:
             files.append(p)
-    files.sort(key=lambda x: x.name.lower())
-    return files
+    return sorted(files)
 
-def set_low_priority_if_possible(enable: bool) -> None:
-    if not enable:
+def write_csv(rows: List[Dict[str, Any]], out_path: Path) -> None:
+    if not rows:
+        out_path.write_text("", encoding="utf-8")
         return
-    psutil = _try_import_psutil()
-    if psutil is None:
-        return
-    try:
-        p = psutil.Process(os.getpid())
-        # Windows: BELOW_NORMAL_PRIORITY_CLASS
-        if hasattr(psutil, "BELOW_NORMAL_PRIORITY_CLASS"):
-            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)  # type: ignore
-    except Exception:
-        return
+    # Header: unión de keys
+    keys: List[str] = []
+    for r in rows:
+        for k in r.keys():
+            if k not in keys:
+                keys.append(k)
 
-def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Parse invoices (UY) from PDFs/images using QR+OCR+heuristics.")
-    ap.add_argument("input", help="Carpeta con facturas (pdf/jpg/png)")
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
-    ap.add_argument("--json", action="store_true", help="Imprime JSON (lista) a stdout")
-    ap.add_argument("--out", default=None, help="Guarda salida JSON en archivo")
-    ap.add_argument("--debug", action="store_true", help="Imprime info adicional")
+def main(argv: List[str]) -> int:
+    ap = argparse.ArgumentParser(description="Parser de facturas (prioridad: PDF con texto DGI).")
+    ap.add_argument("path", help="Archivo o carpeta con facturas (pdf/jpg/png).")
+    ap.add_argument("--json", action="store_true", help="Imprime salida JSON a stdout.")
+    ap.add_argument("--csv", default=None, help="Escribe CSV al path indicado.")
+    ap.add_argument("--debug", action="store_true", help="Incluye _debug por documento.")
+    ap.add_argument("--no-ocr", action="store_true", help="Deshabilita OCR (recomendado si usás solo PDFs con texto).")
+    ap.add_argument("--cpu-threads", type=int, default=1, help="Threads CPU para OCR (si se usa).")
+    ap.add_argument("--low-priority", action="store_true", help="Baja prioridad del proceso (si se puede).")
 
-    ap.add_argument("--report", action="store_true", help="Evalúa contra gold.json y muestra métricas")
-    ap.add_argument("--gold", default=None, help="Ruta a gold.json")
-
-    ap.add_argument("--ocr-mode", default="balanced", choices=["fast", "balanced", "accurate"],
-                    help="Modo OCR (más rápido vs más preciso)")
-    ap.add_argument("--cpu-threads", type=int, default=1, help="Límite de threads CPU")
-    ap.add_argument("--max-dim", type=int, default=1800, help="Máx ancho/alto al hacer OCR")
-    ap.add_argument("--max-pixels", type=int, default=2_500_000, help="Máx píxeles al hacer OCR")
-    ap.add_argument("--low-priority", action="store_true", help="Baja prioridad del proceso (si se puede)")
-    ap.add_argument("--limit", type=int, default=0, help="Procesa solo N docs (0 = todos)")
+    ap.add_argument("--report", action="store_true", help="Compara contra gold.json y muestra métricas.")
+    ap.add_argument("--gold", default=None, help="Path al gold.json (para --report).")
 
     args = ap.parse_args(argv)
 
-    _set_thread_env(args.cpu_threads)
-    set_low_priority_if_possible(args.low_priority)
+    if args.low_priority:
+        set_low_priority_if_possible()
 
-    # Torch thread limit (if present)
-    try:
-        import torch  # type: ignore
-        torch.set_num_threads(max(1, int(args.cpu_threads)))
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
+    base = Path(args.path)
+    files = iter_files(base)
 
-    folder = Path(args.input)
-    if not folder.exists() or not folder.is_dir():
-        print(f"[ERROR] Carpeta inválida: {folder}", file=sys.stderr)
-        return 2
+    preds: List[InvoiceOut] = []
+    rows: List[Dict[str, Any]] = []
 
-    cfg = OCRConfig(
-        mode=args.ocr_mode,
-        cpu_threads=args.cpu_threads,
-        max_dim=args.max_dim,
-        max_pixels=args.max_pixels
-    )
-
-    docs = list_docs(folder)
-    if args.limit and args.limit > 0:
-        docs = docs[: args.limit]
-
-    current_year = time.localtime().tm_year
-
-    results: List[Dict[str, Any]] = []
-
-    for p in docs:
+    for f in files:
+        out = InvoiceOut(_archivo=str(f))
         try:
-            if p.suffix.lower() == ".pdf":
-                text, src = extract_text_from_pdf(p)
+            if f.suffix.lower() == ".pdf":
+                txt = extract_pdf_text(f)
+                if not pdf_has_useful_text(txt):
+                    if args.no_ocr:
+                        raise RuntimeError("PDF sin texto útil y OCR deshabilitado (--no-ocr).")
+                    # OCR a PDF escaneado (caro). Si querés esto, mejor pedir PDF “copiable”.
+                    raise RuntimeError("PDF parece escaneado (sin texto útil). Mejor conseguir PDF digital.")
+                out = parse_dgi_pdf_text(txt, debug=args.debug)
+                out._archivo = str(f)
+                out._fuente = "pdf_text"
             else:
-                text, src = ocr_image_easyocr(p, cfg, debug=args.debug)
-
-            if args.debug:
-                print(f"\n=== {p.name} ({src}) ===")
-                # Print first ~40 lines max
-                for ln in _iter_lines(text)[:40]:
-                    print(ln)
-                print("=== FIN ===\n")
-
-            item = extract_fields_from_text(text, str(p), current_year=current_year)
-            item["_fuente"] = src
-            results.append(item)
+                if args.no_ocr:
+                    raise RuntimeError("Imagen requiere OCR pero está deshabilitado (--no-ocr).")
+                txt = ocr_image_easyocr(f, cpu_threads=max(1, args.cpu_threads))
+                if not txt or len(txt.strip()) < 20:
+                    raise RuntimeError("OCR falló: no se obtuvo texto útil.")
+                out = parse_dgi_pdf_text(txt, debug=args.debug)  # reutiliza parser “por etiquetas”
+                out._archivo = str(f)
+                out._fuente = "image_ocr_easyocr"
 
         except Exception as e:
+            out = InvoiceOut(_archivo=str(f), _fuente="error")
             if args.debug:
-                print(f"[ERROR] {p.name}: {e}")
-            results.append({
-                "fecha": None,
-                "serie": None,
-                "folio": None,
-                "serie_y_folio": None,
-                "razon_social": None,
-                "rut_emisor": None,
-                "es_nota_de_credito": False,
-                "importe_total_con_iva": None,
-                "importe_total_con_iva_num": None,
-                "importe_sin_iva": None,
-                "importe_sin_iva_num": None,
-                "importe_sin_iva_fuente": None,
-                "_archivo": str(p),
-                "_fuente": "error",
-                "_error": str(e),
-            })
+                out._debug = {"error": str(e)}
 
-    # Report
+        # serie_y_folio
+        if out.serie and out.folio:
+            out.serie_y_folio = f"{out.serie}-{out.folio}"
+
+        preds.append(out)
+        d = asdict(out)
+        if not args.debug:
+            d.pop("_debug", None)
+        rows.append(d)
+
     if args.report:
         if not args.gold:
-            print("[ERROR] Usá --gold ruta\\gold.json", file=sys.stderr)
+            print("[ERROR] --report requiere --gold <path>", file=sys.stderr)
             return 2
         gold = load_gold(Path(args.gold))
-        rep = evaluate_against_gold(results, gold)
-        print(rep)
+        compare_with_gold(preds, gold)
 
-    # Output
-    if args.json or args.out:
-        payload = json.dumps(results, ensure_ascii=False, indent=2)
-        if args.out:
-            Path(args.out).write_text(payload, encoding="utf-8")
-        if args.json:
-            print(payload)
+    if args.csv:
+        write_csv(rows, Path(args.csv))
+
+    # default: json si se pide, sino igual imprimí json humano si no hay report/csv
+    if args.json or (not args.report and not args.csv):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
 
     return 0
 
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
